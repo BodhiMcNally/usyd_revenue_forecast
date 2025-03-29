@@ -1,0 +1,890 @@
+---
+title: "STAT3926/STAT4026: Statistical Consulting"
+subtitle: "Forecasting Model for Study Load at the University of Sydney"
+author:
+  - "Prepared by: 520432255, 510288769, 510456265"
+  - "Prepared for: Susie Chee"
+title-block-banner: "#d85f33"
+date: "`r format(Sys.time(), '%d %B, %Y %H:%M')`"
+format: 
+  html: 
+    include-in-header:
+      - style/www/back-to-top.html
+      - style/www/progressbar.html
+    theme:
+      light: [united, style/custom_styles.scss]
+      dark: [darkly, style/custom_styles.scss]
+    embed-resources: true
+    code-fold: true
+    code-tools: false
+    includes:
+      in-header: style/www/header.html 
+    unsafe: true
+    smooth-scroll: true
+table-of-contents: true
+number-sections: false
+engine: knitr
+css: style/custom_styles.css
+execute: 
+  echo: false
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, warning=FALSE, message=FALSE}
+#| code-summary: "Code: Setup"
+
+# Ensure Ubuntu font is downloaded and installed
+# Available from https://fonts.google.com/specimen/Ubuntu
+
+# load necessary packages
+library(conflicted)
+conflicts_prefer(dplyr::filter)
+library(tidyverse)        # For data manipulation and visualization
+library(ggplot2)          # For creating graphs, part of tidyverse but listed for clarity
+library(knitr)            # For creating nice tables in markdown format
+library(gt)               # For creating nice HTML tables
+library(extrafont)        # For using custom fonts in plots
+library(readxl)           # For reading .xlsx files
+library(dplyr)            # For data manipulation and transformation, part of tidyverse
+library(RColorBrewer)     # For additional color palettes
+library(forcats)          # For factor manipulation and reordering, part of tidyverse
+library(Metrics)          # For calculating model metrics
+library(openxlsx)         # For reading from and writing to .xlsx files
+library(forecast)         # For time series forecasting
+library(ggfortify)        # For enabling ggplot2 to handle some stat methods
+library(patchwork)        # For arranging ggplots together
+library(tsibble)          # For creating and manipulating time series data structures
+library(fable)            # For forecasting
+library(scales)           # for date formatting and color palettes
+library(broom)            # For data wrangling
+library(gridExtra)        # For plot aggregation
+```
+
+## Executive Summary
+
+::: justify
+Following recent policy changes regarding International Student enrolment requirements, the client requires a forecasting model to estimate student enrolments and confirm the University’s budget before the Census date. A linear model was created for each faculty, considering the different fee types, years and semesters and the COVID-19 impact from 2020 to 2021. Based on the 2024 linear model predictions, the University is expected to reach budget. However, training the linear model with additional historical data (including consideration of additional variables) is recommended to improve the model’s accuracy.
+:::
+
+## Background
+
+::: justify
+In 2024, the Australian government implemented policy changes for international students at tertiary education institutions designed to enhance the quality of education and reinforce the integrity of the visa system. A key aspect of these changes is that international fee-paying students are no longer mandated to enrol for both Semester 1 and Semester 2 during the initial enrollment period of Semester 1. This shift moves away from the traditional requirement for international students to commit to a full academic year upfront.
+
+This policy adjustment will influence how international students approach their education in Australia. This change may result in more fluctuating enrollment figures from one semester to the next, posing a challenge for the University of Sydney regarding planning and resource allocation.
+
+::: callout-tip
+## Glossary
+
+**CSP (Commonwealth Supported Places):** A funding scheme where the Australian government subsidises the tuition fee of students at Australian universities. This support is only available to domestic students.
+
+**DFEE (Domestic Fee-Paying Students):** Students who do not qualify for Commonwealth support and must pay full tuition fees. These fees are typically higher than those for Commonwealth Supported Places.
+
+**IFEE (International Fee-Paying Students):** Students from countries other than Australia who attend Australian universities. These students pay full tuition fees, which are usually higher than the fees for domestic students.
+
+**EFTSL (Equivalent Full-Time Student Load):** A measure used to indicate the standard annual full-time study load. One EFTSL is typically equivalent to one year of full-time study. This measure is used to calculate the study load of part-time students in proportion to a full-time study load.
+:::
+:::
+
+## Client's Aims
+
+::: justify
+The client requires a forecasting model that can be employed early in the academic year—specifically, pre-census in January or February. This model is intended to provide a reliable preliminary estimate of the entire year’s enrolment figures. It must also adapt to recent policy changes that have eliminated the requirement for international students to enrol for both semesters at the start of the academic year.
+:::
+
+## Data
+
+```{r load-data, message=FALSE, warning=FALSE}
+#| code-summary: "Code: Load Data"
+
+file_path = "EFTSL data.xlsx"
+years = 2018:2022
+sheet_names = paste(years, "sem summaries", sep=" ")
+
+# load and combine data from each sheet, add year and semester
+train_data = lapply(sheet_names, function(sheet) {
+  read_excel(file_path, sheet = sheet) |>
+  mutate(Year = as.numeric(strsplit(sheet, ' ')[[1]][1]))|>
+  mutate(Year_Sem = case_when(Semester == 1 ~ as.numeric(strsplit(sheet, ' ')[[1]][1]), 
+                          .default = as.numeric(strsplit(sheet, ' ')[[1]][1]) + 0.5))}) |> bind_rows()
+
+# load data for testing (2023), add year and semester
+predict_data = read_excel(file_path, sheet = "2023 sem summaries")
+predict_data = predict_data |>
+  mutate(Year = 2023) |> 
+  mutate(Year_Sem = case_when(Semester == 1 ~ 2023.0, 
+                          .default = 2023.5))
+```
+
+```{r prep-data, message=FALSE, warning=FALSE}
+#| code-summary: "Code: Data Preprocessing"
+
+# list of faculties
+## *removed all those that do not fit into this list due to insufficient data* 
+faculties = c('Faculty of Arts and Social Sciences', 'Business School', 'Faculty of Engineering', 'Faculty of Medicine and Health', 'Faculty of Science', 'Sydney School of Architecture, Design and Planning', 'Sydney Law School', 'Sydney Conservatorium of Music')
+
+all_data = rbind(train_data, predict_data) |> select(`Faculty of teaching`,`Fee Type`, `Semester`, `Sum of This Yr`, `Sum of Forecast`, Year, Year_Sem)
+
+predict_data = predict_data |>
+  mutate(Semester = as.factor(Semester),
+         Covid = case_when(Year_Sem %in% c(2020.0, 2020.5, 2021.0, 2021.5) ~ 1, .default = 0)) |>
+  filter(`Faculty of teaching` %in% faculties) |>
+  drop_na()
+
+
+all_data = all_data  |>
+  mutate(Semester = as.factor(Semester), 
+         Covid = case_when(Year_Sem %in% c(2020.0, 2020.5, 2021.0, 2021.5) ~ 1, .default = 0)) |>
+  filter(`Faculty of teaching` %in% faculties) |>
+  drop_na()
+
+all_data = all_data |>
+  mutate(month = ifelse(Semester == 1, "January", "July"),
+         # Create 'date' string
+         date = paste("01", month, Year, sep = "-"),
+         # Convert 'date' string to Date object
+         date = as.Date(date, format = "%d-%B-%Y"))
+```
+
+::: justify
+The provided data, including EFTSL values for 2018-2023, has been plotted below. Most faculties generally show a relatively stable trend in EFTSL over this period. In the Faculty of Engineering and Business School, EFTSL is significantly higher for international students. For Sydney Law School, Faculty of Science, Sydney Conservatorium of Music, and Faculty of Medicine and Health, CSP students account for the majority of EFTSL. The Faculty of Arts and Social Sciences has seen IFEE EFTSL overtake CSP since midway through 2020.
+:::
+
+```{r plot-train_data, message=F, warning=F, fig.width = 13, fig.height= 10, fig.cap = "Figure 1: EFTSL Across Major USYD Faculties, by Fee Type"}
+#| code-summary: "Code: Plot Training Data"
+
+semester_breaks = seq(as.Date("2018-01-01"), as.Date("2023-07-01"), by = "6 months")
+semester_labels = c("2018 Semester 1", "2018 Semester 2", 
+                     "2019 Semester 1", "2019 Semester 2", 
+                     "2020 Semester 1", "2020 Semester 2", 
+                     "2021 Semester 1", "2021 Semester 2", 
+                     "2022 Semester 1", "2022 Semester 2", 
+                     "2023 Semester 1", "2023 Semester 2")
+
+# plotting
+p = ggplot(all_data, aes(y = `Sum of This Yr`, x = date, group = `Fee Type`)) + 
+  geom_line(aes(colour = `Fee Type`)) +
+  geom_point(aes(colour = `Fee Type`)) +
+  facet_wrap(vars(`Faculty of teaching`), scales = 'free_y', ncol = 2) +
+  ggtitle("Study Load Across Faculties") + 
+  labs(y = "Total EFTSL", x = "Year and Semester") +
+  scale_x_continuous(breaks = seq(2018, 2023.5, by = 0.5),
+                     labels = c("2018 Semester 1", "2018 Semester 2", "2019 Semester 1", "2019 Semester 2", "2020 Semester 1", "2020 Semester 2", "2021 Semester 1", "2021 Semester 2", "2022 Semester 1", "2022 Semester 2", "2023 Semester 1", "2023 Semester 2")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 11),
+        axis.text.y = element_text(size = 11),
+        axis.title = element_text(face = "bold", size = 12),
+        plot.title = element_text(face = "bold", size = 22, hjust = 0.5),
+        strip.text = element_text(size = 14, face = "bold"),
+        legend.position = "bottom",
+        legend.box.background = element_rect(colour = "black"),
+        text = element_text(family = "Ubuntu")
+        ) + 
+  scale_x_date(name = "Year and Semester",
+                 breaks = semester_breaks, 
+                 labels = semester_labels) 
+
+p
+```
+
+## Forecast Modelling
+
+::: justify
+A linear model has been created to forecast equivalent full-time study load (EFTSL) for each major Faculty (Faculty of Arts and Social Sciences, Business School, Faculty of Engineering, Faculty of Medicine and Health, Faculty of Science, Sydney School of Architecture, Design and Planning, Sydney Law School and Sydney Conservatorium of Music) within the University. Predicting EFTSL allows for flexibility of the model with variance of University Fees for each faculty and accounts for the varied study load of each student. For each linear model, Fee Type, Year and Semester are considered. A dummy variable was also added to consider the impact of the COVID-19 pandemic on EFTSL.
+
+Assumptions of linear modelling include linearity, homoscedasticity, independence, and normality. Given that each of the data points is independent due to being separated across Semester, Year, Fee Type, and Faculty and has a linear relationship, these assumptions have been met. Further diagnostic plots to demonstrate this can be found in the Appendix (@sec-appendix).
+:::
+
+```{r lm-model, message=FALSE, warning=FALSE}
+#| code-summary: "Code: Modelling"
+
+all_data_tsibble = all_data |>
+  as_tsibble(key = c("Faculty of teaching", "Fee Type"), index = date)
+
+# Fit the model
+models = all_data_tsibble |>
+  model(TSLM(`Sum of This Yr` ~ Year + Semester + Covid)) 
+
+reports = models |>
+  report()
+
+coeffs = models |> 
+  tidy() |> select(-c(.model))
+
+```
+
+::: justify
+A general summary for each model is tabulated below in @tbl-model-summary, and the coefficients of each model are in @tbl-coefficients-table. A model was created for each combination of faculty and fee types, resulting in a total of 24 models. 
+:::
+
+```{r model-summary-table, message=FALSE, warning=FALSE, echo=FALSE}
+#| code-summary: "Code: Model Summary"
+#| label: tbl-model-summary
+#| tbl-cap: "Model Summary"
+
+# select columns
+reports = reports |>
+  select(`Faculty of teaching`, `Fee Type`, r_squared, adj_r_squared, p_value, AIC, AICc)
+
+
+# creating gt tbl
+gt_table = reports |>
+  gt() |>
+   cols_label(
+    `Faculty of teaching` = "Faculty of Teaching",
+    `Fee Type` = "Fee Type",
+    r_squared = "R-Squared",
+    adj_r_squared = "Adjusted R-Squared",
+    p_value = "P-Value",
+    AIC = "AIC",
+    AICc = "Corrected AIC",
+  ) |>
+  fmt_number(
+    columns = vars(r_squared, adj_r_squared, p_value, AIC, AICc),
+    decimals = 2
+  ) |>
+  tab_options(
+    table.font.size = px(12),
+    heading.background.color = "gray",
+    column_labels.font.size = px(11),
+    column_labels.font.weight = "bold",
+    data_row.padding = px(5)
+  )
+
+gt_table
+```
+
+
+::: justify
+::: callout-tip
+## Understanding Model Metrics
+**R-Squared:** This value tells us how well our model's predictions match the actual data. A higher R-Squared value means a better fit.
+
+**Adjusted R-Squared:** This is a tweaked version of R-Squared that adjusts for the number of predictors used in the model. It provides a more accurate score by considering the complexity of the model. Like R-Squared, a higher value indicates a better fit, but it is generally more reliable especially when comparing models with different numbers of predictors.
+
+**P-Value:** This number helps us determine whether the results of our analysis are statistically significant. In simple terms, it tests the probability that the relationships observed in your data occurred by chance. A smaller P-Value (typically less than 0.05) suggests that the findings are significant and not just a random occurrence.
+
+**AIC (Akaike Information Criterion):** This is a tool we use to compare different models. It balances the model’s complexity against how well it fits the data. A lower AIC value indicates a model that better fits the data without becoming overly complex.
+
+**Corrected AIC (AICc):** This is a version of AIC adjusted for smaller sample sizes. It's particularly useful when you have a large number of parameters relative to the number of observations. Like AIC, a lower AICc value suggests a better model.
+:::
+:::
+#### Estimates For Each Coefficients
+
+::: justify
+
+The chart below represents how various factors affect university fees. It breaks down the influence of different variables like the year, the second semester, and COVID-19 for each department.
+
+Semester 1 was kept as a baseline. This means that when predictions are made for the first semester, the model will only consider the year and the impact of COVID-19. This method helps us focus on what changes, rather than what stays the same. 
+
+Similarly, for the COVID-19 impact variable, the default is that there is no COVID-19 impact. This means that when predictions are made for future years, the model doesn't include it in it's forecast.
+
+:::
+
+```{r estimate-plot}
+
+estimate_plot = list()
+
+fee_types = coeffs$`Fee Type` |> unique()
+
+coeffs_filtered = coeffs |>
+  filter(!(term %in% "(Intercept)"))
+
+coeffs_filtered$`Faculty of teaching` = gsub("Faculty of Arts and Social Sciences", "Faculty of Arts \nand Social Sciences", coeffs_filtered$`Faculty of teaching`)
+
+coeffs_filtered$`Faculty of teaching` = gsub("Faculty of Medicine and Health", "Faculty of \nMedicine and Health", coeffs_filtered$`Faculty of teaching`)
+
+coeffs_filtered$`Faculty of teaching` = gsub("Sydney Conservatorium of Music", "Sydney Conservatorium \nof Music", coeffs_filtered$`Faculty of teaching`)
+
+coeffs_filtered$`Faculty of teaching` = gsub("Sydney School of Architecture, Design and Planning", "Sydney School \nof Architecture, \nDesign and Planning", coeffs_filtered$`Faculty of teaching`)
+
+coeffs_filtered$term =  gsub("Semester2", "Semester 2", coeffs_filtered$term)
+
+coeffs_filtered$term =  gsub("Covid", "COVID-19\n Impact", coeffs_filtered$term)
+
+coeffs_filtered$term = factor(coeffs_filtered$term, levels = c("Year", "Semester 2", "COVID-19\n Impact"))
+coeffs_filtered = coeffs_filtered |> select(c(`Faculty of teaching`, `Fee Type`, `term`, estimate))
+
+for (fee in fee_types) {
+  fees_coeff = coeffs_filtered |> filter(`Fee Type` == fee)
+
+   p = ggplot(data=fees_coeff, aes(x=`Faculty of teaching`, y=estimate, fill = term)) + geom_bar(stat="identity") + facet_wrap(~term, ncol = 3) +
+    theme_minimal() +
+ ggtitle(paste("Estimates in Coefficients for each Faculty for", fee))  +
+     scale_fill_brewer(palette = "Set1") +
+       theme(legend.position = "bottom",
+             legend.box.background = element_rect(colour = "black"),
+             legend.direction = "horizontal",
+             legend.box = "vertical",
+             legend.key.size = unit(0.5, "cm"),
+             legend.text = element_text(size = 10),
+             legend.title = element_text(size = 11),
+             axis.text.x = element_text(angle = 90, vjust = 1, hjust = 1),
+             axis.title = element_text(face = "bold"),
+             plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+             text = element_text(family = "Ubuntu")
+             ) +labs(fill = "Parameters")
+
+  estimate_plot[[fee]] = p
+
+}
+```
+
+
+::: panel-tabset
+```{r plot-output-3}
+#| results: asis
+
+# initialise a variable to keep track of the figure number
+figure_number = 1
+
+iwalk(estimate_plot, ~ {
+    figure_number <<- figure_number + 1
+    # cat('## Figure ', figure_number, ': ', .y, '\n\n')
+    cat('## ', .y, '\n\n')
+    print(.x)
+    cat(paste0('<figcaption class="figure-caption">Figure ', figure_number, ': Bar Chart of estimates for ', .y, ' across Faculties.</figcaption> <br>'))
+    if (.y == "IFEE"){
+      cat("For IFEE, EFTSL is higher in Semester 2 across all Faculties with the exception of Faculty of Medicine and Health and Sydney Conservatorium of Music (by a very small amount). The largest increases in Semester 2 EFTSL occur in the Faculty of Arts and Social Sciences, Business School and Faculty of Engineering. With increases in Year, EFTSL increases in all Faculties, by the highest amount in the Faculty of Arts and Social Sciences, followed by the Faculty of Engineering and Faculty of Science. COVID-19 had a positive impact on EFTSL in the Business School, Faculty of Arts and Social Sciences and Faculty of Science." )
+    } else if (.y == "CSP"){
+      cat("For CSP, EFTSL is lower in Semester 2 across all Faculties. The Business School and Faculty of Science have the largest decrease in EFTSL in Semester 2, while compared to other Faculties this negative impact is minimal in the Sydney School of Architecture, Design and Planning. With every increase in Year, EFTSL is increasing in the Faculty of Medicine and Health, Engineering, the Sydney School of Architecture, Design and Planning and Sydney Conservatorium of Music. EFTSL decreases most every year in the Faculty of Arts and Social Sciences. COVID-19 increased EFTSL in all Faculties except for the Faculty of Medicine and Health, where it had a negative impact.")
+    } else{
+      cat("For DFEE, EFTSL is lower in Semester 2 across all Faculties except the Business School. The Faculty of Medicine and Health has the largest decrease in EFTSL in Semester 2.  As the Year increases, EFTSL increases in the Faculty of Medicine and Health, Business School and Sydney School of Architecture, Design and Planning. The Faculty of Arts and Social Sciences and Sydney Law School have the largest decrease in EFTSL with every increase in Year. COVID-19 increased EFTSL in all Faculties except the Sydney Conservatorium of Music. 
+")
+    }
+    
+    cat("\n\n")
+
+})
+```
+:::
+
+### Backcasting
+
+::: justify
+Using the linear model, it is possible to compare predictions of EFTSL for previous years, which can be compared with data to demonstrate the model's performance.
+:::
+
+```{r backcasting, message=FALSE, warning=FALSE}
+#| code-summary: "Code: Backcasting"
+
+# forecasting
+fc = forecast(models, new_data = all_data_tsibble)
+fc_conf_95 = fc$`Sum of This Yr` |> hilo(95)
+conf_df = data.frame(
+  lower_95 = fc_conf_95$lower,
+  upper_95 = fc_conf_95$upper
+)
+fc_w_conf = bind_cols(fc, conf_df)
+
+# retrieve unique faculties
+unique_faculties = all_data_tsibble$`Faculty of teaching` |> unique()
+backcast_plots = list()
+
+semester_breaks = seq(as.Date("2018-01-01"), as.Date("2023-07-01"), by = "6 months")
+semester_labels = c("2018 Semester 1", "2018 Semester 2", 
+                     "2019 Semester 1", "2019 Semester 2", 
+                     "2020 Semester 1", "2020 Semester 2", 
+                     "2021 Semester 1", "2021 Semester 2", 
+                     "2022 Semester 1", "2022 Semester 2", 
+                     "2023 Semester 1", "2023 Semester 2")
+
+# loop through each faculty to create plots
+for (faculty in unique_faculties) {
+  fc_faculty = fc_w_conf |> filter(`Faculty of teaching` == faculty)
+  actual_faculty = all_data_tsibble |> filter(`Faculty of teaching` == faculty)
+
+  # create the plot
+  p = ggplot() +
+    geom_point(data = fc_faculty, aes(x = date, y = .mean, colour = `Fee Type`)) +
+    geom_line(data = fc_faculty, aes(x = date, y = .mean, colour = `Fee Type`, linetype = 'Estimate')) +
+    geom_point(data = actual_faculty, aes(x = date, y = `Sum of Forecast`, colour = `Fee Type`)) +
+    geom_line(data = actual_faculty, aes(x = date, y = `Sum of Forecast`, colour = `Fee Type`, linetype = 'Actual')) +
+    geom_ribbon(data = fc_faculty, aes(x = date, ymin = lower_95, ymax = upper_95, fill = `Fee Type`), alpha = 0.2) +
+    scale_linetype_manual(name = "", values = c("Actual" = "solid", "Estimate" = "dashed")) +
+    scale_fill_manual(name = "95% Confidence Interval", values = hue_pal()(length(unique(fc_faculty$`Fee Type`)))) +
+    guides(fill = guide_legend(override.aes = list(colour = NA, linetype = 0))) +
+    ggtitle(faculty) +
+    ylab("Total EFTSL") +
+    theme_minimal() +
+    theme(legend.position = "bottom", 
+          legend.box.background = element_rect(colour = "black"),
+          legend.direction = "horizontal", 
+          legend.box = "vertical", 
+          legend.key.size = unit(0.5, "cm"),
+          legend.text = element_text(size = 10), 
+          legend.title = element_text(size = 11),
+          legend.margin = margin(t = 0, unit = "pt"),
+          axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+          axis.title = element_text(face = "bold"),
+          plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+          text = element_text(family = "Ubuntu")
+          ) +
+    scale_x_date(name = "Year and Semester",
+                 breaks = semester_breaks, 
+                 labels = semester_labels) +
+    guides(legend = guide_legend(nrow = 2, byrow = TRUE))
+
+  # add the plot to the list
+  backcast_plots[[faculty]] = p
+}
+```
+
+::: panel-tabset
+```{r plot-output-2}
+#| results: asis
+
+# initialise a variable to keep track of the figure number
+figure_number = 4
+
+iwalk(backcast_plots, ~ {
+    figure_number <<- figure_number + 1
+    # cat('## Figure ', figure_number, ': ', .y, '\n\n')
+    cat('## ', .y, '\n\n')
+    print(.x)
+    cat(paste0('<figcaption class="figure-caption">Figure ', figure_number, ': Line Graph of Backcast for ', .y, ' across Fee Types.</figcaption> <br>'))
+    
+    cat("\n\n")
+
+})
+```
+:::
+
+### Forecasting
+
+::: justify
+The forecasting plots below demonstrate EFTSL forecasts for the next five years. Evidently, from the graphs, the model tends to make a large jump in EFTSL estimations. This is likely due to the extrapolation (estimating for larger values than what the data is trained on) occurring here.
+:::
+
+```{r forecasting, message=FALSE, warning=FALSE}
+#| code-summary: "Code: Forecasting"
+
+# prepare forecast data frame, extending to 2025
+long_predict_df = predict_data |>
+  select(`Faculty of teaching`, `Fee Type`, Semester, Covid)
+
+full_forecast_df = data.frame() 
+k = 2023
+
+# create future data points for each semester up to 2025 Semester 2
+for (i in 1:2) {
+  forecast_df = long_predict_df |>
+    mutate(
+      Year = k + i,
+      date = as.Date(ifelse(Semester == 1, paste(Year, "-01-01", sep = ""), paste(Year, "-07-01", sep = "")))
+    )
+  
+  full_forecast_df = rbind(full_forecast_df, forecast_df)
+}
+
+# convert to tsibble for forecasting
+full_forecast_df_tsibble = full_forecast_df |>
+  as_tsibble(key = c("Faculty of teaching", "Fee Type"), index = date)
+
+# forecast
+fc_new_points = forecast(models, new_data = full_forecast_df_tsibble)
+fc_new_conf_95 = fc_new_points$`Sum of This Yr` |> hilo(95)
+conf_new_df = data.frame(
+  lower_95 = fc_new_conf_95$lower,
+  upper_95 = fc_new_conf_95$upper
+)
+fc_new_w_conf = bind_cols(fc_new_points, conf_new_df)
+
+semester_breaks = seq(as.Date("2018-01-01"), as.Date("2025-07-01"), by = "6 months")
+semester_labels = c("2018 Semester 1", "2018 Semester 2", 
+                     "2019 Semester 1", "2019 Semester 2", 
+                     "2020 Semester 1", "2020 Semester 2", 
+                     "2021 Semester 1", "2021 Semester 2", 
+                     "2022 Semester 1", "2022 Semester 2", 
+                     "2023 Semester 1", "2023 Semester 2",
+                    "2024 Semester 1", "2024 Semester 2",
+                    "2025 Semester 1", "2025 Semester 2")
+
+# create plots for each faculty
+complete_forecasts = list()
+for (faculty in unique(full_forecast_df$`Faculty of teaching`)) {
+  fc_faculty = fc_new_w_conf |> filter(`Faculty of teaching` == faculty)
+  actual_faculty = all_data_tsibble |> filter(`Faculty of teaching` == faculty)
+  
+  pl = ggplot() +
+      geom_point(data = actual_faculty,
+                 aes(x = date, y = `Sum of This Yr`, colour = `Fee Type`)) +
+      geom_line(data = actual_faculty, aes(x = date, y = `Sum of This Yr`, colour = `Fee Type`, linetype = 'Actual')) +
+      geom_point(data = fc_faculty, aes(x = date, y = `.mean`, colour = `Fee Type`)) +
+      geom_line(data = fc_faculty, aes(x = date, y = `.mean`, colour = `Fee Type`, linetype = 'Estimate'))+
+      geom_ribbon(data = fc_faculty, aes(x = date, ymin = lower_95, ymax = upper_95, fill = `Fee Type`), alpha = 0.2) + 
+    scale_linetype_manual(name = "", values = c("Actual" = "solid", "Estimate" = "dashed")) +
+      ylab("Total EFTSL") + theme_minimal() + ggtitle(faculty) +
+      scale_fill_manual(name = "95% Confidence Interval",
+                           values = scales::hue_pal()(length(unique(fc_faculty$`Fee Type`)))) +
+      guides(fill = guide_legend(override.aes = list(colour = NA, linetype = 0))) +
+    theme_minimal() +
+    theme(legend.position = "bottom", 
+          legend.box.background = element_rect(colour = "black"),
+          legend.direction = "horizontal", 
+          legend.box = "vertical", 
+          legend.key.size = unit(0.5, "cm"),
+          legend.text = element_text(size = 10), 
+          legend.title = element_text(size = 11),
+          legend.margin = ggplot2::margin(t = 0, unit = "pt"),
+          axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+          axis.title = element_text(face = "bold"),
+          plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+          text = element_text(family = "Ubuntu")
+          ) +
+    scale_x_date(name = "Year and Semester",
+                 breaks = semester_breaks, 
+                 labels = semester_labels) +
+    guides(legend = guide_legend(nrow = 2, byrow = TRUE))
+
+  complete_forecasts[[faculty]] = list(plot = pl)
+}
+```
+
+::: panel-tabset
+```{r plot-output-1}
+#| results: asis
+
+# initialise a variable to keep track of the figure number
+figure_number = 12
+
+iwalk(complete_forecasts, ~ {
+    figure_number <<- figure_number + 1
+    # cat('## Figure ', figure_number, ': ', .y, '\n\n')
+    cat('## ', .y, '\n\n')
+    print(.x$plot)
+    cat(paste0('<figcaption class="figure-caption">Figure ', figure_number, ': Line Graph of Forecast for ', .y, ' across Fee Types.</figcaption> <br>'))
+    
+    cat("\n\n")
+
+})
+```
+:::
+
+
+### Performance
+
+::: justify
+
+Given the relatively small amount of training data (5 years) from which the model has been created, the model is somewhat limited. In particular, the model has been overfitted, meaning that the model cannot accurately extrapolate (estimate values for Years outside of the range of Years on which it was trained) and will continue to predict trends that match those in the training data. Due to the nature of the problem, which involves a change in trends of behaviour concerning Semester 2 enrolments there may be additional changes that the model is not accounting for. 
+
+:::
+
+#### Mean Absolute Error (MAE)
+
+::: justify
+We used a method called Mean Absolute Error (MAE) to evaluate how well our forecasting model performed. This method measures the accuracy of our predictions by calculating the average difference between the predicted student enrollments (EFTSL) and the actual enrollments recorded in 2023. The differences are taken as absolute values, which means we focus only on the size of the errors without considering whether the predictions were too high or too low.
+
+Our results showed that the MAE for our model was higher than the MAE for the existing forecasts. This suggests that our model's predictions were generally further from the actual numbers than the existing forecasts. The larger MAE indicates that our model was less accurate, meaning our predictions about student enrollment were not as close to the actual figures as those of the existing forecasts.
+
+This is likely due to the small size ($n = 5$ years) of the data from which the model was built, as well as our model's inability to account for additional factors of variability in EFTSL compared to the existing model.
+:::
+
+```{r model-performance, message=FALSE, warning=FALSE, echo=FALSE}
+#| code-summary: "Code: Modelling Performance"
+#| label: tbl-MAE
+#| tbl-cap: "Mean Absolute Error (MAE) for Linear Model compared to Existing Forecast"
+
+predicted_dfs = models |>
+  augment(new_data = all_data_tsibble)
+
+all_data_predict = merge(all_data_tsibble, predicted_dfs, by = c('Faculty of teaching', 'Fee Type', 'date'))
+
+# initialise an empty list to store performance data frames for each faculty and fee type
+performance_ls = list()
+i = 1
+
+# loop through each unique combination of faculty and fee type to evaluate model performance
+for(faculty in unique(all_data_tsibble$`Faculty of teaching`)) {
+  for(fee_type in unique(all_data_tsibble$`Fee Type`)) {
+    # filter the predicted dataframe for the current faculty and fee type
+    faculty_predictions =  all_data_predict |>
+      filter(`Faculty of teaching` == faculty, `Fee Type` == fee_type)
+    
+    # create a data frame containing performance metrics for the current faculty and fee type
+    performance = data.frame(
+      "Faculty of Teaching" = faculty,
+      "Fee Type" = fee_type,
+      "Linear Model MAE" = mae(faculty_predictions$.fitted, faculty_predictions$`Sum of This Yr.x`),
+      "Existing Forecast MAE" = mae(faculty_predictions$`Sum of Forecast`, faculty_predictions$`Sum of This Yr.x`)
+    )
+    # append the performance data frame to the list
+    performance_ls[[i]] = performance
+    i = i + 1
+  }
+}
+
+# combine all individual performance data frames into a single data frame
+performance_df = do.call(rbind, performance_ls)
+
+# display the combined performance data in a table
+kable(performance_df, "html", digits = 2, col.names = c("Faculty of teaching", "Fee Type", "Linear Model MAE", "Existing Forecast MAE")) |>
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+#### Percentage Change
+
+::: justify
+Percentage change was also investigated to compare the existing forecast and the linear model. Examining differences in percentage change shows that the model performs most accurately with the CSP and IFEE types. There is a large variance in the DFEE percentage change values, most likely due to the small data available for DFEE students. However, given recent policy changes, the highest priority is to predict IFEE students, so this variance in DFEE is not of great importance.
+:::
+
+```{r percentage-changes, message=FALSE, warning=FALSE}
+#| code-summary: "Code: Finding % change"
+#| label: tbl-percent-change
+#| tbl-cap: "EFTSL Percentage Change"
+#| tbl-subcap:
+#|    - "Average Annual Percentage Change"
+#|    - "Average Annual Forecasted Percentage Change"
+#|    - "Average Annual Estimated Percentage Change"
+#| layout-ncol: 1
+
+# arrange, group, and calculate percentage changes in the an estimation dataframe
+percentage_df = all_data_predict |>
+  arrange(`Faculty of teaching`, `Fee Type`, `date`) |>  
+  group_by(`Faculty of teaching`, `Fee Type`) |> 
+  mutate(percentage_change_actual = (`Sum of This Yr.x` / dplyr::lag(`Sum of This Yr.x`) - 1) * 100,
+         percentage_change_forecast = (`Sum of Forecast` / dplyr::lag(`Sum of Forecast`) - 1) * 100,
+         percentage_change_estimate = (`.fitted` / dplyr::lag(`.fitted`) - 1) * 100) |> 
+  ungroup()
+
+# aggregate and summarise data
+change_sum = percentage_df |>
+  group_by(`Faculty of teaching`, `Fee Type`) |>
+  summarise(`Average Percentage Change (%)` = mean(percentage_change_actual, na.rm = TRUE), 
+            `Average Forecast Percentage Change (%)` = mean(percentage_change_forecast, na.rm = TRUE),
+            `Average Estimate Percentage Change (%)` = mean(percentage_change_estimate, na.rm = TRUE))
+
+# pivot data into wide format
+change_sum_wide_avg = change_sum |>
+  select(-c(`Average Forecast Percentage Change (%)`, `Average Estimate Percentage Change (%)`)) |>
+  pivot_wider(names_from = `Fee Type`, values_from = `Average Percentage Change (%)`)
+change_sum_wide_forecast = change_sum |>
+  select(-c(`Average Percentage Change (%)`, `Average Estimate Percentage Change (%)`)) |>
+  pivot_wider(names_from = `Fee Type`, values_from = `Average Forecast Percentage Change (%)`)
+change_sum_wide_estimate = change_sum |>
+  select(-c(`Average Percentage Change (%)`, `Average Forecast Percentage Change (%)`)) |>
+  pivot_wider(names_from = `Fee Type`, values_from = `Average Estimate Percentage Change (%)`) 
+
+# display the tables
+knitr::kable(change_sum_wide_avg, col.names = c("Faculty of Teaching", "CSP", "DFEE", "IFEE"), digits = 4)  |> kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+knitr::kable(change_sum_wide_forecast, col.names = c("Faculty of Teaching", "CSP", "DFEE", "IFEE"), digits = 4)  |> kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+knitr::kable(change_sum_wide_estimate, col.names = c("Faculty of Teaching", "CSP", "DFEE", "IFEE"), digits = 4)  |> kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+#### Comparison to Existing Forecast 
+
+::: justify
+
+In addition to comparing percentage change across the linear model and existing forecast, the two calculated values can be compared graphically for each Faculty, as seen below in Figures 21-28. 
+
+Visually, the estimated values appear relatively similar across both models, with the exception of EFTSL for IFEE Business School in 2019-2021. The estimates of the Linear Model are more consistent than the Existing Forecast model, which is intuitive given its linear nature, while the existing forecast model may take in account more external factors which would explain more unpredictable trends in estimate values. 
+
+:::
+
+```{r existing-forecast, warning=F, message=F}
+#| code-summary: "Code: Comparison to existing forcast graphs"
+full_fc = bind_rows(fc_w_conf, fc_new_w_conf)
+
+whole_forecasts = list()
+for (faculty in unique(full_forecast_df$`Faculty of teaching`)) {
+  fc_faculty_date = full_fc |> filter(date < "2024-01-01")
+  fc_faculty = fc_faculty_date |> filter(`Faculty of teaching` == faculty)
+  actual_faculty = all_data_tsibble |> filter(`Faculty of teaching` == faculty)
+  
+  pl = ggplot() +
+      geom_line(data = actual_faculty, aes(x = date, group ='Actual', y = `Sum of This Yr`, colour = 'Actual', linetype = 'Actual'))+
+      # geom_point(data = actual_faculty,
+      #            aes(x = date, y = `Sum of This Yr`, colour = `Fee Type`)) +
+      geom_line(data = actual_faculty, aes(x = date, group = 'Existing Forecast', y = `Sum of Forecast`, colour = 'Existing Forecast', linetype = 'Existing Forecast')) +
+      # geom_point(data = fc_faculty, aes(x = date, y = `.mean`, colour = `Fee Type`)) +
+      geom_line(data = fc_faculty, aes(x = date, group = 'Linear Model Forecast', y = `.mean`, colour = 'Linear Model Forecast', linetype = 'Linear Model Forecast'))+
+    scale_linetype_manual(name = "", values = c("Existing Forecast" = "twodash", "Linear Model Forecast" = "dashed", "Actual" = "solid")) +
+scale_color_manual(name = "", values = c("Existing Forecast" = "blue", "Linear Model Forecast" = "red", "Actual" = "black")) +
+      ylab("Total EFTSL") + theme_minimal() + ggtitle(faculty) +
+      # guides(fill = guide_legend(override.aes = list(colour = NA, linetype = 0))) +
+    theme_minimal() +
+    theme(legend.position = "bottom", 
+          legend.box.background = element_rect(colour = "black"),
+          legend.direction = "horizontal", 
+          legend.box = "vertical", 
+          legend.key.size = unit(0.5, "cm"),
+          legend.text = element_text(size = 10), 
+          legend.title = element_text(size = 11),
+          legend.margin = ggplot2::margin(t = 0, unit = "pt"),
+          axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+          axis.title = element_text(face = "bold"),
+          plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+          text = element_text(family = "Ubuntu")
+          ) +
+    scale_x_date(name = "Year and Semester",
+                 breaks = semester_breaks, 
+                 labels = semester_labels) +
+    guides(legend = guide_legend(nrow = 2, byrow = TRUE)) + facet_wrap(~`Fee Type`, scale = "free_y", ncol = 1)
+
+  whole_forecasts[[faculty]] = list(plot = pl)
+}
+```
+::: panel-tabset
+```{r plot-output-wholemodels}
+#| results: asis
+
+# initialise a variable to keep track of the figure number
+figure_number = 20
+
+iwalk(whole_forecasts, ~ {
+    figure_number <<- figure_number + 1
+    # cat('## Figure ', figure_number, ': ', .y, '\n\n')
+    cat('## ', .y, '\n\n')
+    print(.x$plot)
+    cat(paste0('<figcaption class="figure-caption">Figure ', figure_number, ': Line Graph of Forecast for ', .y, ' across Fee Types.</figcaption> <br>'))
+    
+    cat("\n\n")
+
+})
+```
+:::
+
+### Budget
+
+::: justify
+Regarding the client's concerns about meeting budget, the linear model forecasts an overall income of \$2,416,435,480 across the major faculties of the University of Sydney in 2024. The split of this income across Faculties can be seen in @tbl-budget-calculation below.
+
+This exceeds the budgets of the previous years, supporting the University's on-track meeting of the budget for 2024.
+:::
+
+```{r 2024-budget, message = F,warning=F, echo=FALSE}
+#| code-summary: "Code: 2024 Budget Calculation"
+#| label: tbl-budget-calculation
+#| tbl-cap: "2024 Estimated EFTSL and Total Fees for each Faculty"
+
+avg_rates = read_excel('Revenue_Forecasting_Project.xlsx', 9)
+avg_rates_short = avg_rates[1:8,]
+avg_rates_short$`Faculty of teaching` = faculties
+avg_rates_long = avg_rates_short |> pivot_longer(c(CSP, DFEE, IFEE), names_to = "Fee Type", values_to = "cost")
+
+# dataframe for the 2024 budget data (filtered from all forecasts)
+budget_24 = fc_new_points |> filter(Year == 2024)
+
+# merge forecast data with average rates based on faculty and fee type
+budget_24_merged = merge(budget_24, avg_rates_long, by = c("Faculty of teaching", "Fee Type"))
+
+# calculate projected revenue by multiplying the estimate by the cost
+budget_24_merged = budget_24_merged |> 
+  mutate(revenue = .mean * cost)
+
+# summarise the estimated student load and income by faculty
+budget_24_summ = budget_24_merged |>
+  group_by(`Faculty of teaching`) |>
+  summarise(
+    EFTSL = sum(.mean),
+    `Income ($)` = sum(revenue) 
+  ) |>
+  # add a row for the total of all faculties
+  bind_rows(summarise(budget_24_merged, `Faculty of teaching` = "Total", EFTSL = sum(.mean), `Income ($)` = sum(revenue)))
+
+# display the table
+knitr::kable(budget_24_summ, col.names = c("Faculty of Teaching", "EFTSL", "Income (AUD$)"), format.args = list(big.mark = ",",
+  scientific = FALSE)) |>
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+## Conclusion
+
+::: justify
+By constructing a linear model, EFTSL forecasting within each major Faculty of the University of Sydney has become possible. While this model does not perform as well as the existing forecast method, it has the potential for significant improvement with additional hisotrical data for training and consideration of factors influencing student enrolment that were not available in the initial dataset.  With these enhancements, the model can further aid in forecasting enrolments from International Students in light of recent policy changes. However, it is important to consider such policies will lead to new behaviours in student enrolment and the current model is based on old behaviours so there may be further changes unaccounted for by the model. Nevertheless, based on the results of the linear model, the University of Sydney is on track to meet its budget for 2024.
+:::
+
+## Appendix {#sec-appendix}
+
+### A. Fees per EFTSL in each Faculty
+
+```{r fees, message=F, warning=F}
+#| code-summary: "Code: Fees for Each Faculty"
+#| label: tbl-fee-faculty
+#| tbl-cap: "Fee ($AUD) per EFTSL for each Faculty"
+
+avg_rates = read_excel('Revenue_Forecasting_Project.xlsx', 9)
+avg_rates_short = avg_rates[1:8,]
+avg_rates_short$`Faculty of teaching` = faculties
+avg_rates_nice = avg_rates_short |>
+  select(c("Faculty of teaching", "CSP", "DFEE", "IFEE"))
+
+knitr::kable(avg_rates_nice, format.args = list(big.mark = ",", scientific = FALSE)) |>
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+### B. Coefficients for each Linear model
+```{r coefficients-table, message=FALSE, warning=FALSE, echo=FALSE}
+#| code-summary: "Code: Coefficients Summary"
+#| label: tbl-coefficients-table
+#| tbl-cap: "Coefficients Table"
+
+coeffs_wide = coeffs |> 
+  select(c(`Faculty of teaching`, `Fee Type`, term, estimate)) |> 
+  pivot_wider(names_from = term, values_from = estimate)
+
+kable(coeffs_wide, "html", digits = 0, col.names = c("Faculty of Teaching", "Fee Type", "Intercept", "Year", "Semester 2", "COVID-19 Impact")) |>
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+
+```
+
+### C. Diagnostic Plots for each Linear Model
+
+```{r, diagnostic-plots, message=FALSE, results='hide', warning = FALSE}
+#| code-summary: "Code: Diagnostic Plots"
+
+# initialise a list
+diag_plots = list() 
+
+for(faculty in unique(all_data_tsibble$`Faculty of teaching`)) {
+  faculty_list = list()  # create a list for each faculty
+  for(fee_type in unique(all_data_tsibble$`Fee Type`)) {
+    m = models |> filter(`Faculty of teaching` == faculty, `Fee Type` == fee_type)
+    tslm_model = m$`TSLM(\`Sum of This Yr\` ~ Year + Semester + Covid)`[[1]]  
+
+    model_summary = tidy(tslm_model)
+    residuals = augment(tslm_model)
+    
+    res_p = ggplot(residuals, aes(.fitted, .resid)) +
+      geom_point() +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+      labs(title = "Residuals vs Fitted") + theme_bw()
+    
+    qq_p = ggplot(residuals, aes(sample = .resid)) +
+      stat_qq() +
+      stat_qq_line() +
+      labs(title = "Normal Q-Q plot") +theme_bw()
+    
+    title = paste("Diagnostic Plots for", faculty, fee_type)
+    
+    # add plots and title to the fee_type list
+    faculty_list[[fee_type]] = list(res = res_p, qq = qq_p, title = title)
+  }
+  # add the fee_type list to the diag_plots list
+  diag_plots[[faculty]] = faculty_list
+}
+
+```
+
+::: panel-tabset
+```{r plot-output-diagnostics, message=F, warning=F}
+#| results: asis
+
+# initialise a variable to keep track of the figure number
+figure_number = 28
+
+iwalk(diag_plots, ~ {
+    cat('## ', .y, '\n\n')
+    iwalk(.x, ~ {
+      figure_number <<- figure_number + 1
+      cat('### ', .y, '\n\n')
+      (grid.arrange(.x$res, .x$qq, ncol=2,  top = .x$title))
+      cat(paste0('<figcaption class="figure-caption">Figure ', figure_number, ': Diagnostic Plots for ', .y, '.</figcaption> <br>'))
+      cat("\n\n")
+    })
+    cat("\n\n")
+
+})
+```
+:::
